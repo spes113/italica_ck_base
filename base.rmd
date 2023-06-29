@@ -1,0 +1,248 @@
+---
+title: "co kriging Italica"
+author: "Esperanza"
+date: "6/5/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=TRUE, warning=TRUE}
+library(rgdal)
+library(raster)
+library(ggspatial) ##ggplot for spatial analysis
+library(ggplot2)
+library(GISTools)
+library(maptools)
+library(spdep) ##autocorrelation analysis
+library(pgirmess) 
+library(gstat)
+library(scales)
+library(car)
+library(MASS)
+```
+
+
+Import dataset and access the data.
+
+```{r message=FALSE, warning=FALSE}
+setwd("C:/TESIS/Output/co_kriging_v2")
+cb0= readOGR ("C:/TESIS/Output/co_kriging_v2/c0_base.shp")
+grd1= readOGR ("C:/TESIS/Output/co_kriging_v2/grid.shp")
+
+```
+
+```{r}
+cb0.df=as.data.frame(cb0)
+```
+
+
+
+# Step 1: co-kriging
+
+Inspect the distribution of values through histogram.
+
+```{r}
+hist(cb0$Z)
+```
+
+
+```{r}
+cb0.df= data.frame(cb0)
+```
+
+The assessment confirms that we don't need to normalise the data.
+
+## Moran's I Correlogram - Area 1
+
+```{r}
+cb0.cor= correlog(coordinates(cb0), cb0$Z, method = "Moran")
+cb0.cor
+
+```
+```{r}
+cb0.cor= as.data.frame(cb0.cor)
+ggplot(cb0.cor, aes(dist.class,coef))+
+  geom_point(aes(col=p.value), size= 3)+
+  labs(x = "Distance classes", y = "Moran's I Statistic",
+  colour = "P Value",  title = "Correlogram")
+```
+
+## Local Moran's I (Anselin's LISA)
+
+0-100 lag will be used based on the correlogram.
+
+```{r}
+cb0.dnn=dnearneigh(cb0,0,100)
+summary(cb0.dnn, cb0, longlat=TRUE, scale=0.5)
+```
+
+1 region within this distance lag have no neighbours. So we try with the second distance lag: 0-200
+
+```{r}
+cb0.dnn=dnearneigh(cb0,0,200)
+summary(cb0.dnn, cb0, longlat=TRUE, scale=0.5)
+```
+
+All the regions have neighbours, so this distance lag will be used to compute Local Moran's I. 
+
+```{r}
+cb0.dnn.w<-nb2listw(cb0.dnn,style="B") 
+cb0.lmoran<-localmoran(cb0$Z,cb0.dnn.w) 
+```
+
+Now we plot the result of the the local Moran's I. 
+
+```{r}
+pval=ifelse(cb0.lmoran[,5]<0.05,"p< 0.05","p> 0.05")
+I=as.vector(cb0.lmoran[,1])
+ggplot()+
+  layer_spatial(cb0,aes(size=I, col= pval))+
+  labs(size = "Moran's I",  col = "P Value")
+```
+
+## Variogram
+
+```{r}
+max(dist(coordinates(cb0)))
+cb0.var= variogram(cb0$Z~1,cb0, cutoff=500)
+plot(cb0.var)
+cb0.fitvar= vgm(50,"Sph",170,0)
+plot(cb0.var,cb0.fitvar)
+```
+
+## Ordinary Kriging 
+
+In order to perform Ordinary Kriging we create a grid from grd1.
+
+```{r}
+grd1.df= as.data.frame(coordinates(grd1))
+
+coordinates(grd1.df) <- ~coords.x1 + coords.x2
+gridded(grd1.df) <- TRUE
+```
+
+```{r}
+cb0.df= as.data.frame(cb0)
+cb0.spdf= SpatialPointsDataFrame(cb0.df[2:3], cb0.df[1])
+```
+
+Now we use the krige function and plot the results. 
+
+```{r}
+cb0.ok<-krige(cb0$Z~1,cb0.spdf,grd1.df,cb0.fitvar)
+cb0.ok %>% as.data.frame %>%
+  ggplot(aes(x=coords.x1, y=coords.x2)) + geom_tile(aes(fill=var1.pred)) + coord_equal() +
+  scale_fill_gradient(low = "yellow", high="blue") +
+  scale_x_continuous(labels=comma) + scale_y_continuous(labels=comma) +
+  theme_bw()
+ok.ras= raster(cb0.ok)
+writeRaster(ok.ras,
+            filename = "ok_base", "GTiff", overwrite=T)
+```
+The prediction seems to be to much influenced by the distribution of points. Hence, we try to use co-Kriging to see if is it possible to obtain a more reliable prediction. 
+
+The new variable that will be used for the prediction is the modern elevation of the analysed area. We import data: "c1_base.shp", a Spatial Point Data Frame that contains elevations of both the Roman (Z) and the Contemporary (mde) periods, measured in the same spots. Moreover, we import data "cp_base.shp", which contains measurements of modern elevation in 156 random distributed spots for which we don't know the ancient elevation. 
+
+```{r message=FALSE, warning=FALSE}
+cb1= readOGR ("C:/TESIS/Output/co_kriging_v2/c1_base.shp") 
+cp= readOGR ("C:/TESIS/Output/co_kriging_v2/cp_base.shp")
+```
+
+Plot modern elevation
+```{r}
+ggplot()+
+  layer_spatial(cp, aes(size=mdt, col= mdt))
+```
+
+## Correlation between variables
+
+We plot a scatter plot in order to see if a correlation between the two variables exists. In order to do so, we use the dataset containing both ancient and modern elevation. 
+
+```{r}
+cb1.df= as.data.frame(cb1)
+ggplot(cb1.df, aes(x=Z, y=mdt)) + 
+  geom_point(size=4)
+```
+
+We compute the correlation coefficient. 
+
+```{r}
+cor= cor(cb1.df, method= "pearson")
+head(cor)
+```
+
+## Variogram 
+
+We plot and fit the variogram of only modern elevation. 
+
+```{r}
+cp.var= variogram(cp$mdt~1,cp)
+plot(cp.var)
+cp.fitvar= vgm(27, "Sph", 300,0)
+plot(cp.var,cp.fitvar)
+```
+
+We build a gstat structure containing the two sample sets: "ancient elevation" and "modern elevation"
+```{r}
+
+gb=gstat(id="ancient elevation",form= cb0$Z~1,data= cb0)
+gb=gstat(gb,id="modern elevation",form=cp$mdt~1,data=cp)
+
+```
+
+We create and plot a cross-variogram of the two variables
+
+```{r}
+vcross= variogram(gb)
+```
+```{r}
+plot(vcross)
+```
+
+No we add a variogram models to the gstat object and fit it using linear model of co-regionalisation.
+
+```{r}
+gb= gstat(gb, id= "ancient elevation", model= cb0.fitvar, fill.all = T) 
+```
+
+Now the gstat object contains both the data and the models.
+As a further step, we fit all the three variograms using the fit.lmc method (fit linear model of co-regionalization) (Rossiter, 2018)
+
+```{r}
+(gb= fit.lmc(vcross,gb, fit.method=6, correct.diagonal = 1.01))
+```
+```{r}
+plot(variogram(gb), model=gb$model)
+```
+
+We use the predict function
+```{r}
+
+grd1.df= as.data.frame(coordinates(grd1))
+
+coordinates(grd1.df) <- ~coords.x1 + coords.x2
+gridded(grd1.df) <- TRUE
+
+crs(grd1.df)=crs(cp)
+
+k.c = predict(gb, grd1.df)
+
+```
+
+```{r}
+plot(k.c)
+```
+
+
+```{r}
+kc.ras= raster(k.c)
+writeRaster(kc.ras,
+            filename = "ck_base", "GTiff", overwrite=T)
+```
+
